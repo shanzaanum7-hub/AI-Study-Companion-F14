@@ -1,315 +1,292 @@
 """
-Qdrant Service
+qdrant_service.py
+------------------
+Handles all interaction with the Qdrant Vector Database.
 
-Manages all interactions with the Qdrant vector database:
-  - Collection lifecycle (create, check, delete)
-  - Upsert / delete vectors
-  - Similarity search
+Responsibilities:
+- Auto-create the "study_notes" collection if it doesn't exist.
+- Store vectors (id, document_id, chunk_id, text, embedding).
+- Retrieve vectors (similarity search).
+- Delete vectors belonging to a document.
+
+Follows clean architecture: this module only knows about Qdrant.
+Callers (routers/other services) should not import qdrant_client directly.
 """
 
-from __future__ import annotations
-
+import os
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import List, Dict, Any, Optional
 
-from app.config import get_settings
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
+from qdrant_client.http.exceptions import UnexpectedResponse
+import httpx
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 # ---------------------------------------------------------------------------
-# Optional qdrant-client import
+# Configuration (read from .env)
 # ---------------------------------------------------------------------------
-try:
-    from qdrant_client import QdrantClient  # type: ignore
-    from qdrant_client.http import models as qmodels  # type: ignore
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
+QDRANT_URL = os.getenv("QDRANT_URL") or f"http://{QDRANT_HOST}:{QDRANT_PORT}"
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")  # optional, e.g. for Qdrant Cloud
 
-    _QDRANT_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _QDRANT_AVAILABLE = False
-    logger.warning(
-        "qdrant-client is not installed. Vector storage will not work. "
-        "Install with: pip install qdrant-client"
-    )
+# NOTE: This is a DIFFERENT collection from QDRANT_COLLECTION_NAME (used by the
+# 384-dim sentence-transformers pipeline elsewhere in the project). Keep them separate.
+QDRANT_COLLECTION_NAME = os.getenv("STUDY_NOTES_COLLECTION", "study_notes")
 
-
-# ---------------------------------------------------------------------------
-# Data class for search results
-# ---------------------------------------------------------------------------
+# Gemini text-embedding-004 = 768 dimensions (different from the 384-dim
+# sentence-transformers model used elsewhere in the project).
+EMBEDDING_VECTOR_SIZE = int(os.getenv("GEMINI_EMBEDDING_DIMENSION", 768))
+QDRANT_DISTANCE_METRIC = os.getenv("QDRANT_DISTANCE_METRIC", "Cosine")
 
 
-class VectorSearchResult:
-    """Represents a single result from a Qdrant similarity search."""
-
-    __slots__ = ("id", "score", "payload")
-
-    def __init__(self, id: str, score: float, payload: Dict[str, Any]) -> None:
-        self.id = id
-        self.score = score
-        self.payload = payload
-
-    def __repr__(self) -> str:  # pragma: no cover
-        return f"VectorSearchResult(id={self.id!r}, score={self.score:.4f})"
+class QdrantServiceError(Exception):
+    """Base exception for Qdrant service errors."""
 
 
-# ---------------------------------------------------------------------------
-# Service class
-# ---------------------------------------------------------------------------
+class QdrantConnectionError(QdrantServiceError):
+    """Raised when Qdrant cannot be reached (connection refused, host down, etc.)."""
 
 
-class QdrantService:
-    """
-    Thin wrapper around the Qdrant Python client.
+class QdrantDimensionMismatchError(QdrantServiceError):
+    """Raised when the embedding size doesn't match the collection's vector size."""
 
-    Provides collection management and vector CRUD operations.
-    All methods log at DEBUG/INFO level and propagate exceptions to callers.
 
-    Args:
-        collection_name: Qdrant collection to operate on (default from settings).
-        vector_size:     Dimensionality of stored vectors (default from settings).
-    """
+class QdrantCollectionError(QdrantServiceError):
+    """Raised for collection-related errors (creation/check failures)."""
 
-    def __init__(
-        self,
-        collection_name: Optional[str] = None,
-        vector_size: Optional[int] = None,
-    ) -> None:
-        self.collection_name = collection_name or settings.QDRANT_COLLECTION_NAME
-        self.vector_size = vector_size or settings.EMBEDDING_DIMENSION
-        self._client: Optional["QdrantClient"] = None
 
-    # ------------------------------------------------------------------
-    # Client lifecycle
-    # ------------------------------------------------------------------
+_client: Optional[QdrantClient] = None
 
-    @property
-    def client(self) -> "QdrantClient":
-        """Return a lazy-initialised Qdrant client."""
-        if self._client is None:
-            self._client = self._build_client()
-        return self._client
 
-    def _build_client(self) -> "QdrantClient":
-        """Instantiate and return a QdrantClient."""
-        if not _QDRANT_AVAILABLE:
-            raise RuntimeError(
-                "qdrant-client is required. Install with: pip install qdrant-client"
+def _get_client() -> QdrantClient:
+    """Lazily create and cache a QdrantClient instance."""
+    global _client
+    if _client is None:
+        try:
+            _client = QdrantClient(
+                url=QDRANT_URL,
+                api_key=QDRANT_API_KEY,
+                timeout=10,
             )
-        logger.info(
-            "Connecting to Qdrant at %s:%d", settings.QDRANT_HOST, settings.QDRANT_PORT
-        )
-        return QdrantClient(
-            host=settings.QDRANT_HOST,
-            port=settings.QDRANT_PORT,
-            api_key=settings.QDRANT_API_KEY,
-            prefer_grpc=False,
-        )
+        except Exception as e:
+            raise QdrantConnectionError(
+                f"Could not create Qdrant client for {QDRANT_URL}: {e}"
+            ) from e
+    return _client
 
-    # ------------------------------------------------------------------
-    # Collection management
-    # ------------------------------------------------------------------
 
-    def ensure_collection(self) -> None:
-        """
-        Create the collection if it does not already exist.
+def _distance_enum() -> qmodels.Distance:
+    mapping = {
+        "cosine": qmodels.Distance.COSINE,
+        "euclid": qmodels.Distance.EUCLID,
+        "dot": qmodels.Distance.DOT,
+    }
+    return mapping.get(QDRANT_DISTANCE_METRIC.lower(), qmodels.Distance.COSINE)
 
-        Uses cosine distance and the configured vector size.
-        """
-        existing = [c.name for c in self.client.get_collections().collections]
-        if self.collection_name in existing:
-            logger.debug("Collection '%s' already exists.", self.collection_name)
-            return
 
-        logger.info(
-            "Creating Qdrant collection '%s' (dim=%d)",
-            self.collection_name,
-            self.vector_size,
-        )
-        self.client.create_collection(
-            collection_name=self.collection_name,
+def ensure_collection_exists(vector_size: int = EMBEDDING_VECTOR_SIZE) -> None:
+    """
+    Check if the study_notes collection exists; create it if not.
+    Safe to call multiple times.
+    """
+    client = _get_client()
+
+    try:
+        exists = client.collection_exists(QDRANT_COLLECTION_NAME)
+    except (httpx.ConnectError, ConnectionRefusedError) as e:
+        raise QdrantConnectionError(
+            f"Cannot connect to Qdrant at {QDRANT_URL}. Is it running? Details: {e}"
+        ) from e
+    except Exception as e:
+        raise QdrantCollectionError(f"Error checking collection existence: {e}") from e
+
+    if exists:
+        logger.info("Qdrant collection '%s' already exists.", QDRANT_COLLECTION_NAME)
+        return
+
+    try:
+        client.create_collection(
+            collection_name=QDRANT_COLLECTION_NAME,
             vectors_config=qmodels.VectorParams(
-                size=self.vector_size,
-                distance=qmodels.Distance.COSINE,
+                size=vector_size,
+                distance=_distance_enum(),
             ),
         )
-        logger.info("Collection '%s' created.", self.collection_name)
+        logger.info("Created Qdrant collection '%s'.", QDRANT_COLLECTION_NAME)
+    except Exception as e:
+        raise QdrantCollectionError(
+            f"Failed to create collection '{QDRANT_COLLECTION_NAME}': {e}"
+        ) from e
 
-    def collection_exists(self) -> bool:
-        """Return True if the collection exists in Qdrant."""
-        collections = [c.name for c in self.client.get_collections().collections]
-        return self.collection_name in collections
 
-    def delete_collection(self) -> None:
-        """Delete the collection and all its vectors (irreversible)."""
-        if self.collection_exists():
-            self.client.delete_collection(self.collection_name)
-            logger.info("Collection '%s' deleted.", self.collection_name)
+def store_vectors(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Store chunk vectors in Qdrant.
 
-    def get_collection_info(self) -> Dict[str, Any]:
-        """
-        Return basic stats about the collection.
+    Args:
+        items: List of dicts, each containing:
+            {
+                "document_id": str,
+                "chunk_id": str,
+                "text": str,
+                "embedding": List[float]
+            }
 
-        Returns:
-            Dict with keys: name, vectors_count, status.
-        """
-        info = self.client.get_collection(self.collection_name)
-        return {
-            "name": self.collection_name,
-            "vectors_count": info.vectors_count,
-            "status": str(info.status),
-        }
+    Returns:
+        {"status": "success", "count": <int>}
+    """
+    if not items:
+        return {"status": "success", "count": 0}
 
-    # ------------------------------------------------------------------
-    # Vector CRUD
-    # ------------------------------------------------------------------
+    ensure_collection_exists(vector_size=len(items[0]["embedding"]))
 
-    def upsert_vectors(
-        self,
-        vectors: List[List[float]],
-        payloads: List[Dict[str, Any]],
-        ids: Optional[List[str]] = None,
-    ) -> None:
-        """
-        Upsert a batch of vectors with associated payloads.
+    client = _get_client()
+    points = []
 
-        Args:
-            vectors:  List of embedding vectors (each a list of floats).
-            payloads: List of metadata dicts, one per vector.
-            ids:      Optional list of string IDs; auto-generated if None.
+    for item in items:
+        embedding = item.get("embedding")
+        if embedding is None:
+            raise QdrantServiceError(f"Missing embedding for chunk {item.get('chunk_id')}")
 
-        Raises:
-            ValueError: If lengths of vectors and payloads differ.
-        """
-        if len(vectors) != len(payloads):
-            raise ValueError("vectors and payloads must have the same length.")
+        if len(embedding) != EMBEDDING_VECTOR_SIZE:
+            raise QdrantDimensionMismatchError(
+                f"Embedding size {len(embedding)} does not match expected "
+                f"collection size {EMBEDDING_VECTOR_SIZE} for chunk {item.get('chunk_id')}."
+            )
 
-        point_ids = ids or [uuid.uuid4().hex for _ in vectors]
-
-        points = [
-            qmodels.PointStruct(id=pid, vector=vec, payload=pay)
-            for pid, vec, pay in zip(point_ids, vectors, payloads)
-        ]
-
-        self.client.upsert(collection_name=self.collection_name, points=points)
-        logger.debug(
-            "Upserted %d vectors into collection '%s'.",
-            len(points),
-            self.collection_name,
+        point_id = str(uuid.uuid4())
+        points.append(
+            qmodels.PointStruct(
+                id=point_id,
+                vector=embedding,
+                payload={
+                    "document_id": item.get("document_id"),
+                    "chunk_id": item.get("chunk_id"),
+                    "text": item.get("text"),
+                },
+            )
         )
 
-    def delete_by_document_id(self, document_id: uuid.UUID) -> None:
-        """
-        Delete all vectors whose payload contains the given document_id.
+    try:
+        client.upsert(collection_name=QDRANT_COLLECTION_NAME, points=points)
+    except UnexpectedResponse as e:
+        # e.g. dimension mismatch reported by the server itself
+        if "dimension" in str(e).lower():
+            raise QdrantDimensionMismatchError(
+                f"Qdrant rejected the upsert due to a vector dimension mismatch: {e}"
+            ) from e
+        raise QdrantServiceError(f"Qdrant upsert failed: {e}") from e
+    except (httpx.ConnectError, ConnectionRefusedError) as e:
+        raise QdrantConnectionError(
+            f"Cannot connect to Qdrant at {QDRANT_URL} while storing vectors: {e}"
+        ) from e
 
-        Args:
-            document_id: UUID of the document whose chunks should be removed.
-        """
-        self.client.delete(
-            collection_name=self.collection_name,
+    return {"status": "success", "count": len(points)}
+
+
+def retrieve_vectors(
+    query_embedding: List[float],
+    top_k: int = 5,
+    score_threshold: Optional[float] = None,
+    document_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Retrieve the most similar chunks to a query embedding.
+
+    Args:
+        query_embedding: Embedding vector of the user query.
+        top_k: Number of results to return.
+        score_threshold: Minimum similarity score to include a result.
+        document_id: Optional filter to search within a single document.
+
+    Returns:
+        List of dicts: [{"chunk_id", "document_id", "text", "score"}]
+    """
+    ensure_collection_exists(vector_size=len(query_embedding))
+
+    client = _get_client()
+
+    query_filter = None
+    if document_id:
+        query_filter = qmodels.Filter(
+            must=[
+                qmodels.FieldCondition(
+                    key="document_id",
+                    match=qmodels.MatchValue(value=document_id),
+                )
+            ]
+        )
+
+    try:
+        results = client.search(
+            collection_name=QDRANT_COLLECTION_NAME,
+            query_vector=query_embedding,
+            limit=top_k,
+            score_threshold=score_threshold,
+            query_filter=query_filter,
+        )
+    except UnexpectedResponse as e:
+        if "dimension" in str(e).lower():
+            raise QdrantDimensionMismatchError(
+                f"Query embedding dimension does not match collection: {e}"
+            ) from e
+        raise QdrantServiceError(f"Qdrant search failed: {e}") from e
+    except (httpx.ConnectError, ConnectionRefusedError) as e:
+        raise QdrantConnectionError(
+            f"Cannot connect to Qdrant at {QDRANT_URL} while searching: {e}"
+        ) from e
+
+    return [
+        {
+            "chunk_id": hit.payload.get("chunk_id"),
+            "document_id": hit.payload.get("document_id"),
+            "text": hit.payload.get("text"),
+            "score": hit.score,
+        }
+        for hit in results
+    ]
+
+
+def delete_document_vectors(document_id: str) -> Dict[str, Any]:
+    """
+    Delete all vectors belonging to a specific document.
+
+    Args:
+        document_id: The document whose chunks should be removed.
+
+    Returns:
+        {"status": "success", "document_id": document_id}
+    """
+    if not document_id:
+        raise ValueError("document_id must be provided.")
+
+    client = _get_client()
+
+    try:
+        client.delete(
+            collection_name=QDRANT_COLLECTION_NAME,
             points_selector=qmodels.FilterSelector(
                 filter=qmodels.Filter(
                     must=[
                         qmodels.FieldCondition(
                             key="document_id",
-                            match=qmodels.MatchValue(value=str(document_id)),
+                            match=qmodels.MatchValue(value=document_id),
                         )
                     ]
                 )
             ),
         )
-        logger.info(
-            "Deleted vectors for document_id '%s' from collection '%s'.",
-            document_id,
-            self.collection_name,
-        )
+    except (httpx.ConnectError, ConnectionRefusedError) as e:
+        raise QdrantConnectionError(
+            f"Cannot connect to Qdrant at {QDRANT_URL} while deleting vectors: {e}"
+        ) from e
+    except Exception as e:
+        raise QdrantServiceError(
+            f"Failed to delete vectors for document {document_id}: {e}"
+        ) from e
 
-    # ------------------------------------------------------------------
-    # Search
-    # ------------------------------------------------------------------
-
-    def search(
-        self,
-        query_vector: List[float],
-        top_k: Optional[int] = None,
-        score_threshold: Optional[float] = None,
-        filter_document_ids: Optional[List[uuid.UUID]] = None,
-        filter_subject: Optional[str] = None,
-    ) -> List[VectorSearchResult]:
-        """
-        Perform a cosine similarity search.
-
-        Args:
-            query_vector:        Embedding of the search query.
-            top_k:               Max results to return (default from settings).
-            score_threshold:     Min similarity score (default from settings).
-            filter_document_ids: Restrict to these document IDs (optional).
-            filter_subject:      Restrict to this subject tag (optional).
-
-        Returns:
-            List of :class:`VectorSearchResult`, sorted by descending score.
-        """
-        k = top_k or settings.RETRIEVAL_TOP_K
-        threshold = score_threshold if score_threshold is not None else settings.RETRIEVAL_SCORE_THRESHOLD
-
-        must_conditions: List[Any] = []
-
-        if filter_document_ids:
-            must_conditions.append(
-                qmodels.FieldCondition(
-                    key="document_id",
-                    match=qmodels.MatchAny(
-                        any=[str(did) for did in filter_document_ids]
-                    ),
-                )
-            )
-
-        if filter_subject:
-            must_conditions.append(
-                qmodels.FieldCondition(
-                    key="subject",
-                    match=qmodels.MatchValue(value=filter_subject),
-                )
-            )
-
-        query_filter = qmodels.Filter(must=must_conditions) if must_conditions else None
-
-        hits = self.client.search(
-            collection_name=self.collection_name,
-            query_vector=query_vector,
-            limit=k,
-            score_threshold=threshold,
-            query_filter=query_filter,
-            with_payload=True,
-        )
-
-        results = [
-            VectorSearchResult(id=str(hit.id), score=hit.score, payload=hit.payload or {})
-            for hit in hits
-        ]
-
-        logger.debug(
-            "Search returned %d results (top_k=%d, threshold=%.2f).",
-            len(results),
-            k,
-            threshold,
-        )
-        return results
-
-    # ------------------------------------------------------------------
-    # Health check
-    # ------------------------------------------------------------------
-
-    def ping(self) -> bool:
-        """
-        Check connectivity to the Qdrant server.
-
-        Returns:
-            True if reachable, False otherwise.
-        """
-        try:
-            self.client.get_collections()
-            return True
-        except Exception as exc:
-            logger.warning("Qdrant ping failed: %s", exc)
-            return False
+    return {"status": "success", "document_id": document_id}

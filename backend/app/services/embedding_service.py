@@ -1,159 +1,180 @@
 """
-Embedding Service
+embedding_service.py
+---------------------
+Handles embedding generation using the Google Gemini Embedding API.
 
-Converts text strings into dense vector representations using a
-sentence-transformer model (or a configurable provider).
+Responsibilities:
+- Generate embeddings for document chunks.
+- Generate embeddings for user queries.
+- Handle API timeouts, invalid API keys, and rate limits with retries.
 
-The service is intentionally stateless with respect to storage —
-it only produces vectors. Persistence is handled by :mod:`qdrant_service`.
+No API keys are hardcoded — everything is read from environment variables (.env).
 """
 
-from __future__ import annotations
-
+import os
+import time
 import logging
-from functools import lru_cache
-from typing import List, Optional
+from typing import List, Dict, Any
 
-from app.config import get_settings
+import google.generativeai as genai
+from google.api_core.exceptions import (
+    ResourceExhausted,
+    DeadlineExceeded,
+    Unauthenticated,
+    PermissionDenied,
+    ServiceUnavailable,
+)
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 # ---------------------------------------------------------------------------
-# Optional sentence-transformers import
+# Configuration (read from .env)
 # ---------------------------------------------------------------------------
-try:
-    from sentence_transformers import SentenceTransformer  # type: ignore
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004")
+# Kept in sync with GEMINI_EMBEDDING_DIMENSION in .env — used by qdrant_service.py
+GEMINI_EMBEDDING_DIMENSION = int(os.getenv("GEMINI_EMBEDDING_DIMENSION", 768))
 
-    _ST_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _ST_AVAILABLE = False
-    logger.warning(
-        "sentence-transformers is not installed. Embedding will not work. "
-        "Install with: pip install sentence-transformers"
+MAX_RETRIES = int(os.getenv("EMBEDDING_MAX_RETRIES", 3))
+RETRY_BACKOFF_SECONDS = float(os.getenv("EMBEDDING_RETRY_BACKOFF", 2))
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("EMBEDDING_TIMEOUT", 30))
+
+
+class EmbeddingServiceError(Exception):
+    """Base exception for embedding service errors."""
+
+
+class InvalidAPIKeyError(EmbeddingServiceError):
+    """Raised when the Gemini API key is missing or invalid."""
+
+
+class RateLimitError(EmbeddingServiceError):
+    """Raised when the Gemini API rate limit is hit and retries are exhausted."""
+
+
+class EmbeddingTimeoutError(EmbeddingServiceError):
+    """Raised when the Gemini API call times out repeatedly."""
+
+
+def _configure_client() -> None:
+    """Configure the Gemini client. Raises InvalidAPIKeyError if key is missing."""
+    if not GEMINI_API_KEY:
+        raise InvalidAPIKeyError(
+            "GEMINI_API_KEY is not set. Please add it to your .env file."
+        )
+    genai.configure(api_key=GEMINI_API_KEY)
+
+
+def _embed_with_retry(text: str, task_type: str) -> List[float]:
+    """
+    Call the Gemini embedding API with retry logic for transient failures.
+
+    task_type: "retrieval_document" for chunks, "retrieval_query" for queries.
+    """
+    _configure_client()
+
+    last_exception: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = genai.embed_content(
+                model=GEMINI_EMBEDDING_MODEL,
+                content=text,
+                task_type=task_type,
+                request_options={"timeout": REQUEST_TIMEOUT_SECONDS},
+            )
+            embedding = response.get("embedding")
+            if not embedding:
+                raise EmbeddingServiceError("Gemini API returned an empty embedding.")
+            return embedding
+
+        except (Unauthenticated, PermissionDenied) as e:
+            # Invalid API key — no point retrying.
+            raise InvalidAPIKeyError(f"Invalid or unauthorized Gemini API key: {e}") from e
+
+        except ResourceExhausted as e:
+            # Rate limit hit — retry with backoff.
+            last_exception = e
+            logger.warning(
+                "Gemini rate limit hit (attempt %s/%s). Retrying...", attempt, MAX_RETRIES
+            )
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+
+        except (DeadlineExceeded, ServiceUnavailable, TimeoutError) as e:
+            # Timeout / transient outage — retry with backoff.
+            last_exception = e
+            logger.warning(
+                "Gemini request timeout/unavailable (attempt %s/%s). Retrying...",
+                attempt,
+                MAX_RETRIES,
+            )
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+
+        except Exception as e:
+            # Unknown error — do not silently retry forever, but allow one retry pass.
+            last_exception = e
+            logger.error("Unexpected error from Gemini API: %s", e)
+            time.sleep(RETRY_BACKOFF_SECONDS)
+
+    # Retries exhausted
+    if isinstance(last_exception, ResourceExhausted):
+        raise RateLimitError(
+            f"Gemini API rate limit exceeded after {MAX_RETRIES} attempts."
+        ) from last_exception
+    if isinstance(last_exception, (DeadlineExceeded, TimeoutError, ServiceUnavailable)):
+        raise EmbeddingTimeoutError(
+            f"Gemini API timed out after {MAX_RETRIES} attempts."
+        ) from last_exception
+
+    raise EmbeddingServiceError(
+        f"Failed to generate embedding after {MAX_RETRIES} attempts: {last_exception}"
     )
 
 
-# ---------------------------------------------------------------------------
-# Model loader (cached singleton per model name)
-# ---------------------------------------------------------------------------
-
-
-@lru_cache(maxsize=2)
-def _load_model(model_name: str) -> "SentenceTransformer":
+def generate_chunk_embeddings(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Load and cache a SentenceTransformer model by name.
+    Generate embeddings for a list of document chunks.
 
     Args:
-        model_name: HuggingFace model identifier.
+        chunks: List of dicts, each containing at least:
+            {"chunk_id": str, "text": str}
 
     Returns:
-        Loaded SentenceTransformer instance.
-
-    Raises:
-        RuntimeError: If sentence-transformers is not installed.
+        List of dicts in the form:
+            [{"chunk_id": "...", "embedding": [...]}]
     """
-    if not _ST_AVAILABLE:
-        raise RuntimeError(
-            "sentence-transformers is required. "
-            "Install with: pip install sentence-transformers"
-        )
-    logger.info("Loading embedding model: %s", model_name)
-    model = SentenceTransformer(model_name)
-    logger.info("Embedding model loaded: %s", model_name)
-    return model
+    results: List[Dict[str, Any]] = []
+
+    for chunk in chunks:
+        chunk_id = chunk.get("chunk_id")
+        text = chunk.get("text", "")
+
+        if not chunk_id or not text.strip():
+            logger.warning("Skipping chunk with missing id or empty text: %s", chunk)
+            continue
+
+        try:
+            embedding = _embed_with_retry(text, task_type="retrieval_document")
+            results.append({"chunk_id": chunk_id, "embedding": embedding})
+        except EmbeddingServiceError as e:
+            logger.error("Failed to embed chunk %s: %s", chunk_id, e)
+            # Re-raise so the caller (e.g. upload pipeline) knows something failed.
+            raise
+
+    return results
 
 
-# ---------------------------------------------------------------------------
-# Service class
-# ---------------------------------------------------------------------------
-
-
-class EmbeddingService:
+def generate_query_embedding(query: str) -> List[float]:
     """
-    Generates dense vector embeddings for text strings.
+    Generate an embedding for a single user query.
 
     Args:
-        model_name:  HuggingFace model identifier (default from settings).
-        batch_size:  Number of texts to embed per forward pass.
-        normalize:   Whether to L2-normalise output vectors (recommended for
-                     cosine similarity).
+        query: The user's search/question text.
+
+    Returns:
+        A list of floats representing the query embedding.
     """
+    if not query or not query.strip():
+        raise ValueError("Query text must not be empty.")
 
-    def __init__(
-        self,
-        model_name: Optional[str] = None,
-        batch_size: int = 32,
-        normalize: bool = True,
-    ) -> None:
-        self.model_name = model_name or settings.EMBEDDING_MODEL
-        self.batch_size = batch_size
-        self.normalize = normalize
-        self._dimension: Optional[int] = None
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def embed_text(self, text: str) -> List[float]:
-        """
-        Embed a single string.
-
-        Args:
-            text: Input text to embed.
-
-        Returns:
-            List of floats representing the embedding vector.
-        """
-        vectors = self.embed_batch([text])
-        return vectors[0]
-
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """
-        Embed a list of strings in batches.
-
-        Args:
-            texts: List of input strings.
-
-        Returns:
-            List of embedding vectors, one per input string.
-
-        Raises:
-            ValueError: If *texts* is empty.
-            RuntimeError: If the model cannot be loaded.
-        """
-        if not texts:
-            raise ValueError("texts must be a non-empty list.")
-
-        model = _load_model(self.model_name)
-
-        logger.debug(
-            "Embedding %d text(s) with model '%s'", len(texts), self.model_name
-        )
-
-        vectors = model.encode(
-            texts,
-            batch_size=self.batch_size,
-            normalize_embeddings=self.normalize,
-            show_progress_bar=False,
-        )
-
-        # Convert numpy array to plain Python lists for JSON serialisability
-        return [vec.tolist() for vec in vectors]
-
-    @property
-    def dimension(self) -> int:
-        """
-        Return the output dimensionality of the current embedding model.
-
-        Loads the model on first access; subsequent calls are free.
-        """
-        if self._dimension is None:
-            model = _load_model(self.model_name)
-            # SentenceTransformer exposes get_sentence_embedding_dimension()
-            self._dimension = model.get_sentence_embedding_dimension()
-        return self._dimension  # type: ignore[return-value]
-
-    def get_model_name(self) -> str:
-        """Return the active embedding model name."""
-        return self.model_name
+    return _embed_with_retry(query, task_type="retrieval_query")
