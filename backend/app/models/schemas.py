@@ -78,6 +78,39 @@ class UploadMetadataSchema(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class SimpleRetrieveSchema(BaseModel):
+    """
+    Minimal payload for the POST /api/retrieve endpoint.
+
+    Only ``query`` is required. Optional fields allow callers to narrow
+    the search scope or tune result quality without extra endpoints.
+    """
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        description="Natural-language question or keyword to search for",
+        examples=["CPU Scheduling"],
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum number of chunks to return (default: 5)",
+    )
+    score_threshold: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Minimum cosine similarity score (0–1). Omit to return all top-k results.",
+    )
+    document_id: Optional[str] = Field(
+        default=None,
+        description="Restrict search to a single document by its ID",
+    )
+
+
 class RetrievalQuerySchema(BaseModel):
     """Payload for a semantic similarity search."""
 
@@ -138,6 +171,45 @@ class AskQuestionSchema(BaseModel):
 # ---------------------------------------------------------------------------
 # Study-plan schemas
 # ---------------------------------------------------------------------------
+
+
+class StudyPlanQuerySchema(BaseModel):
+    """
+    Minimal payload for the POST /api/study-plan endpoint.
+
+    Mirrors the same lean design as :class:`SimpleRetrieveSchema` —
+    only ``query`` is required.  The service layer derives everything else
+    (retrieval top-k, prompt language, day count) from application defaults
+    so the client stays simple.
+
+    Example request body::
+
+        {"query": "CPU Scheduling"}
+    """
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="Topic or question to generate a study plan for",
+        examples=["CPU Scheduling"],
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of context chunks to retrieve from the index (default: 5)",
+    )
+    duration_days: int = Field(
+        default=7,
+        ge=1,
+        le=30,
+        description="Desired plan length in days (default: 7)",
+    )
+    difficulty: DifficultyLevel = Field(
+        default=DifficultyLevel.INTERMEDIATE,
+        description="Target difficulty level",
+    )
 
 
 class GenerateStudyPlanSchema(BaseModel):

@@ -1,220 +1,305 @@
-"""
-Upload Router
-
-Handles all file-upload operations:
-  POST   /upload            – upload and queue a PDF for processing
-  GET    /upload/{doc_id}   – get document status / metadata
-  DELETE /upload/{doc_id}   – remove a document and its vectors
-  GET    /upload            – list uploaded documents
-"""
-
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
-from typing import Annotated, List, Optional
+from pathlib import Path
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 
 from app.config import Settings, get_settings
-from app.models.response_models import APIResponse, DocumentResponse, UploadResponse
+from app.models.response_models import APIResponse, UploadResponse
 from app.models.schemas import LanguageCode, UploadMetadataSchema
-from app.utils.file_handler import (
-    build_upload_path,
-    compute_sha256,
-    save_upload_file,
-    validate_content_type,
-    validate_extension,
-    validate_file_size,
-    delete_upload,
+from app.services.ingestion_service import (
+    delete_document_vectors,
+    ingest_document,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/upload", tags=["Upload"])
 
+MAX_FILE_SIZE = 20 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".pdf", ".txt"}
 
-# ---------------------------------------------------------------------------
-# Dependency helpers
-# ---------------------------------------------------------------------------
+# Prototype ke liye in-memory status store.
+# Server restart hone par ye data reset ho jayega.
+DOCUMENTS: dict[str, dict[str, Any]] = {}
 
 
 def get_settings_dep() -> Settings:
     return get_settings()
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+def _safe_filename(filename: str) -> str:
+    """Prevent path traversal and keep only the file name."""
+    name = Path(filename).name.strip()
+
+    if not name:
+        return "uploaded_document"
+
+    return name
 
 
 @router.post(
     "",
-    summary="Upload a PDF document",
+    summary="Upload and index a PDF or TXT document",
     description=(
-        "Accept a PDF file and optional metadata. "
-        "The file is validated, stored, and queued for chunking + indexing."
+        "Uploads a document, creates chunks, generates embeddings, "
+        "and stores vectors in Qdrant."
     ),
     response_model=APIResponse[UploadResponse],
-    status_code=status.HTTP_202_ACCEPTED,
+    status_code=status.HTTP_201_CREATED,
 )
 async def upload_document(
-    file: Annotated[UploadFile, File(description="PDF file to upload")],
-    title: Annotated[Optional[str], Form(description="Document title")] = None,
-    subject: Annotated[Optional[str], Form(description="Subject or topic")] = None,
-    language: Annotated[LanguageCode, Form(description="Primary language")] = LanguageCode.EN,
-    tags: Annotated[Optional[str], Form(description="Comma-separated tags")] = None,
+    file: Annotated[
+        UploadFile,
+        File(description="PDF or TXT study document"),
+    ],
+    title: Annotated[str | None, Form()] = None,
+    subject: Annotated[str | None, Form()] = None,
+    language: Annotated[LanguageCode, Form()] = LanguageCode.EN,
+    tags: Annotated[str | None, Form()] = None,
     settings: Settings = Depends(get_settings_dep),
 ) -> APIResponse[UploadResponse]:
-    """
-    Upload a PDF document for ingestion.
+    filename = _safe_filename(file.filename or "")
+    suffix = Path(filename).suffix.lower()
 
-    - Validates file type, MIME, and size.
-    - Saves the file to the upload directory.
-    - Returns a document ID and ``processing`` status.
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Only PDF and TXT files are supported.",
+        )
 
-    The actual chunking and embedding pipeline is triggered asynchronously
-    (background task / worker — wired up when business logic is implemented).
-    """
-    logger.info("Upload request received: filename=%r", file.filename)
+    # Metadata validation
+    tag_list = [
+        item.strip().lower()
+        for item in (tags or "").split(",")
+        if item.strip()
+    ]
 
-    # 1. Validate extension
-    validate_extension(file.filename or "")
-
-    # 2. Validate MIME type
-    validate_content_type(file)
-
-    # 3. Validate file size (reads then seeks back to 0)
-    file_size = await validate_file_size(file)
-
-    # 4. Parse tags from comma-separated form field
-    tag_list: List[str] = []
-    if tags:
-        tag_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
-
-    # 5. Build metadata schema for validation
-    metadata = UploadMetadataSchema(
+    UploadMetadataSchema(
         title=title,
         subject=subject,
         language=language,
         tags=tag_list,
     )
 
-    # 6. Assign a document ID and compute checksum
-    document_id = uuid.uuid4()
-    sha256, _ = await compute_sha256(file)
-    logger.debug("File SHA-256: %s, size: %d bytes", sha256, file_size)
+    file_bytes = await file.read()
 
-    # 7. Persist to disk
-    destination = build_upload_path(file.filename or "upload.pdf", document_id)
-    await save_upload_file(file, destination)
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty.",
+        )
+
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Maximum file size is 20 MB.",
+        )
+
+    if suffix == ".pdf" and not file_bytes.startswith(b"%PDF"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The uploaded file is not a valid PDF.",
+        )
+
+    document_id = uuid.uuid4()
+
+    upload_dir = Path(
+        getattr(
+            settings,
+            "UPLOAD_DIR",
+            Path(__file__).resolve().parents[1] / "uploads",
+        )
+    )
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    destination = upload_dir / f"{document_id}_{filename}"
+    destination.write_bytes(file_bytes)
+
+    sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+    DOCUMENTS[str(document_id)] = {
+        "document_id": str(document_id),
+        "filename": filename,
+        "status": "processing",
+        "title": title,
+        "subject": subject,
+        "language": str(language),
+        "tags": tag_list,
+        "sha256": sha256,
+        "file_size": len(file_bytes),
+    }
 
     logger.info(
-        "Document %s saved to '%s'. Queuing for processing.",
+        "Saved document %s to %s",
         document_id,
         destination,
     )
 
-    # 8. TODO: dispatch background ingestion task (pdf → chunk → embed → index)
-
-    return APIResponse(
-        success=True,
-        message="File uploaded successfully and queued for processing.",
-        data=UploadResponse(
+    try:
+        # Synchronous processing prototype ke liye behtar hai:
+        # response tab milega jab Qdrant mein vectors store ho chuke hon.
+        result = await ingest_document(
+            file_path=destination,
             document_id=document_id,
-            filename=destination.name,
-            status="processing",
-            message="Your document is being processed. Use the document ID to check status.",
-        ),
-    )
+            settings=settings,
+        )
+
+        DOCUMENTS[str(document_id)].update(
+            {
+                "status": "completed",
+                **result,
+            }
+        )
+
+        logger.info(
+            "Document %s indexed successfully.",
+            document_id,
+        )
+
+        return APIResponse(
+            success=True,
+            message="File uploaded and indexed successfully.",
+            data=UploadResponse(
+                document_id=document_id,
+                filename=filename,
+                status="completed",
+                message=(
+                    f"Created {result['chunks']} chunks and stored "
+                    f"{result['chunks']} vectors in Qdrant."
+                ),
+            ),
+        )
+
+    except Exception as exc:
+        DOCUMENTS[str(document_id)]["status"] = "failed"
+        DOCUMENTS[str(document_id)]["error"] = str(exc)
+
+        logger.exception(
+            "Ingestion failed for document %s",
+            document_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "File was saved, but indexing failed. "
+                "Check the FastAPI terminal logs."
+            ),
+        ) from exc
 
 
 @router.get(
     "",
     summary="List uploaded documents",
-    description="Return a paginated list of all uploaded documents.",
-    response_model=APIResponse[List[dict]],
-    status_code=status.HTTP_200_OK,
+    response_model=APIResponse[list[dict]],
 )
 async def list_documents(
-    page: Annotated[int, Query(ge=1, description="Page number")] = 1,
-    page_size: Annotated[int, Query(ge=1, le=100, description="Items per page")] = 20,
-    subject: Annotated[Optional[str], Query(description="Filter by subject")] = None,
-) -> APIResponse[List[dict]]:
-    """
-    List all uploaded documents.
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    subject: Annotated[str | None, Query()] = None,
+) -> APIResponse[list[dict]]:
+    documents = list(DOCUMENTS.values())
 
-    Placeholder — returns an empty list until the persistence layer is wired up.
-    """
-    logger.info("List documents: page=%d, page_size=%d, subject=%s", page, page_size, subject)
+    if subject:
+        documents = [
+            item
+            for item in documents
+            if item.get("subject") == subject
+        ]
 
-    # TODO: query document metadata store and return real records
+    start = (page - 1) * page_size
+    end = start + page_size
+
     return APIResponse(
         success=True,
         message="Document list retrieved.",
-        data=[],
+        data=documents[start:end],
     )
 
 
 @router.get(
     "/{document_id}",
     summary="Get document status",
-    description="Retrieve metadata and processing status for a specific document.",
-    response_model=APIResponse[DocumentResponse],
-    status_code=status.HTTP_200_OK,
-    responses={404: {"description": "Document not found"}},
+    response_model=APIResponse[dict],
 )
 async def get_document(
     document_id: uuid.UUID,
-) -> APIResponse[DocumentResponse]:
-    """
-    Return metadata and processing status for *document_id*.
-
-    Placeholder — raises 404 until the persistence layer is wired up.
-    """
-    logger.info("Get document: %s", document_id)
-
-    # TODO: query document store for real metadata
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"Document '{document_id}' not found.",
-    )
-
-
-@router.delete(
-    "/{document_id}",
-    summary="Delete a document",
-    description="Remove a document, its uploaded file, and all indexed vectors.",
-    response_model=APIResponse[dict],
-    status_code=status.HTTP_200_OK,
-    responses={404: {"description": "Document not found"}},
-)
-async def delete_document(
-    document_id: uuid.UUID,
 ) -> APIResponse[dict]:
-    """
-    Delete a document and all associated data.
+    document = DOCUMENTS.get(str(document_id))
 
-    - Removes the uploaded file from disk.
-    - TODO: removes vectors from Qdrant.
-    - TODO: removes metadata from the document store.
-    """
-    logger.info("Delete document: %s", document_id)
-
-    # Remove uploaded file from disk (best-effort)
-    removed = delete_upload(document_id)
-
-    if not removed:
+    if not document:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Document '{document_id}' not found.",
         )
 
-    # TODO: delete vectors from Qdrant via retrieval_service.delete_document()
-    # TODO: delete metadata record from document store
+    return APIResponse(
+        success=True,
+        message="Document status retrieved.",
+        data=document,
+    )
+
+
+@router.delete(
+    "/{document_id}",
+    summary="Delete a document and its vectors",
+    response_model=APIResponse[dict],
+)
+async def delete_document(
+    document_id: uuid.UUID,
+    settings: Settings = Depends(get_settings_dep),
+) -> APIResponse[dict]:
+    document_key = str(document_id)
+    document = DOCUMENTS.get(document_key)
+
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document '{document_id}' not found.",
+        )
+
+    try:
+        delete_document_vectors(
+            document_id=document_id,
+            settings=settings,
+        )
+    except Exception:
+        logger.exception(
+            "Could not delete Qdrant vectors for %s",
+            document_id,
+        )
+
+    filename = document.get("filename", "")
+    upload_dir = Path(
+        getattr(
+            settings,
+            "UPLOAD_DIR",
+            Path(__file__).resolve().parents[1] / "uploads",
+        )
+    )
+    file_path = upload_dir / f"{document_id}_{filename}"
+
+    if file_path.exists():
+        file_path.unlink()
+
+    DOCUMENTS.pop(document_key, None)
 
     return APIResponse(
         success=True,
-        message=f"Document '{document_id}' deleted successfully.",
-        data={"document_id": str(document_id)},
+        message="Document and its vectors deleted successfully.",
+        data={"document_id": document_key},
     )

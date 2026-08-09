@@ -92,15 +92,59 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # LLM
     # ------------------------------------------------------------------
-    LLM_PROVIDER: str = Field(default="openai", description="LLM provider: openai | anthropic | ollama")
-    OPENAI_API_KEY: str | None = Field(default=None, description="OpenAI API key")
-    OPENAI_MODEL: str = Field(default="gpt-4o-mini", description="OpenAI chat model identifier")
-    ANTHROPIC_API_KEY: str | None = Field(default=None, description="Anthropic API key")
-    ANTHROPIC_MODEL: str = Field(default="claude-3-haiku-20240307", description="Anthropic model identifier")
-    OLLAMA_BASE_URL: str = Field(default="http://localhost:11434", description="Ollama base URL")
-    OLLAMA_MODEL: str = Field(default="llama3", description="Ollama model name")
-    LLM_TEMPERATURE: float = Field(default=0.2, description="Sampling temperature for generation")
-    LLM_MAX_TOKENS: int = Field(default=1024, description="Maximum tokens to generate per response")
+    LLM_PROVIDER: str = Field(default="gemini", description="LLM provider")
+
+    GEMINI_API_KEY: str | None = Field(
+        default=None,
+        description="Google Gemini API key"
+    )
+
+    GEMINI_MODEL: str = Field(
+        default="gemini-3.6-flash",
+        description="Gemini model identifier"
+    )
+
+    OPENAI_API_KEY: str | None = Field(
+        default=None,
+        description="OpenAI API key"
+    )
+
+    OPENAI_MODEL: str = Field(
+        default="gpt-4o-mini",
+        description="OpenAI chat model identifier"
+    )
+
+    ANTHROPIC_API_KEY: str | None = Field(
+        default=None,
+        description="Anthropic API key"
+    )
+
+    ANTHROPIC_MODEL: str = Field(
+        default="claude-3-haiku-20240307",
+        description="Anthropic model identifier"
+    )
+
+    OLLAMA_BASE_URL: str = Field(
+        default="http://localhost:11434",
+        description="Ollama base URL"
+    )
+
+    OLLAMA_MODEL: str = Field(
+        default="llama3",
+        description="Ollama model name"
+    )
+
+    LLM_TEMPERATURE: float = Field(
+        default=0.2,
+        description="Sampling temperature for generation"
+    )
+
+    LLM_MAX_TOKENS: int = Field(
+        default=1024,
+        description="Maximum tokens to generate per response"
+    )
+
+
 
     # ------------------------------------------------------------------
     # Retrieval

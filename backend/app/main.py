@@ -218,15 +218,30 @@ def create_app() -> FastAPI:
     # Routers
     # ------------------------------------------------------------------
 
-    API_PREFIX = "/api/v1"
+    API_V1 = "/api/v1"
+    API    = "/api"
 
-    app.include_router(health.router, prefix=API_PREFIX)
-    app.include_router(upload.router, prefix=API_PREFIX)
-    app.include_router(retrieval.router, prefix=API_PREFIX)
-    app.include_router(study_plan.router, prefix=API_PREFIX)
+    # Health and upload stay under /api/v1 only
+    app.include_router(health.router,  prefix=API_V1)
+    app.include_router(upload.router,  prefix=API_V1)
+
+    # Retrieval router is mounted at both prefixes:
+    #   /api    → POST /api/retrieve              (primary simple endpoint)
+    #   /api/v1 → POST /api/v1/retrieval/search   (full search with filters)
+    #             POST /api/v1/retrieval/ask       (RAG Q&A)
+    app.include_router(retrieval.router, prefix=API)
+    app.include_router(retrieval.router, prefix=API_V1)
+
+    # Study-plan router is mounted at both prefixes:
+    #   /api    → POST /api/study-plan              (primary simple endpoint)
+    #   /api/v1 → POST /api/v1/study-plan/generate  (full options endpoint)
+    #             POST /api/v1/study-plan/summary    (summarisation)
+    #             POST /api/v1/study-plan/flashcards (flashcard generation)
+    app.include_router(study_plan.router, prefix=API)
+    app.include_router(study_plan.router, prefix=API_V1)
 
     logger.info(
-        "Registered routers: %s",
+        "Registered routes: %s",
         [route.path for route in app.routes if hasattr(route, "path")],  # type: ignore[union-attr]
     )
 
