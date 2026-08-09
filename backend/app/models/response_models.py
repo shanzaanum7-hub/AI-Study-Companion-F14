@@ -115,6 +115,48 @@ class ChunkResult(BaseModel):
     chunk_index: int = Field(..., ge=0, description="Zero-based index of the chunk within the document")
 
 
+class SimpleRetrieveResult(BaseModel):
+    """
+    A single result item returned by POST /api/retrieve.
+
+    Intentionally lean: only the fields the client needs for display,
+    plus the similarity score so the caller can apply their own threshold.
+    """
+
+    score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Cosine similarity score — higher means more relevant (0–1)",
+    )
+    text: str = Field(..., description="The matching chunk text")
+    chunk_id: Optional[str] = Field(default=None, description="Internal chunk identifier")
+    document_id: Optional[str] = Field(default=None, description="Source document identifier")
+    page_number: Optional[int] = Field(default=None, description="Page number in the source PDF, if available")
+
+
+class SimpleRetrieveResponse(BaseModel):
+    """
+    Response envelope for POST /api/retrieve.
+
+    Matches the exact shape requested::
+
+        {
+            "query": "CPU Scheduling",
+            "results": [
+                {"score": 0.92, "text": "..."},
+                ...
+            ]
+        }
+    """
+
+    query: str = Field(..., description="The original search query echoed back")
+    results: List[SimpleRetrieveResult] = Field(
+        default_factory=list,
+        description="Ranked list of matching chunks, ordered by descending score",
+    )
+
+
 class RetrievalResponse(BaseModel):
     """Result of a semantic search query."""
 
@@ -207,6 +249,101 @@ class SummaryResponse(BaseModel):
         description="IDs of documents used as source material",
     )
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# Simple study-plan response models  (POST /api/study-plan)
+# ---------------------------------------------------------------------------
+
+
+class StudyPlanTask(BaseModel):
+    """
+    A single actionable task within a study day.
+
+    Matches the ``tasks`` array items in the expected output::
+
+        {"task": "Read chapter 3 on Round Robin scheduling"}
+    """
+
+    task: str = Field(..., description="Actionable study task description")
+
+
+class StudyPlanDay(BaseModel):
+    """
+    One day's entry in the study plan schedule.
+
+    Matches the exact shape specified in the prompt contract::
+
+        {
+            "day": 1,
+            "focus": "Introduction to CPU Scheduling",
+            "tasks": ["Read ...", "Summarise ..."]
+        }
+    """
+
+    day: int = Field(..., ge=1, description="Day number (1-indexed)")
+    focus: str = Field(..., description="Primary topic or concept for this day")
+    tasks: List[str] = Field(
+        default_factory=list,
+        description="Ordered list of actionable study tasks",
+    )
+
+
+class StudyPlanResult(BaseModel):
+    """
+    The parsed study plan returned by the Gemini LLM.
+
+    Matches the exact JSON contract required by the spec::
+
+        {
+            "topic": "CPU Scheduling",
+            "estimated_days": 5,
+            "study_plan": [
+                {"day": 1, "focus": "...", "tasks": [...]}
+            ]
+        }
+    """
+
+    topic: str = Field(..., description="The main study topic")
+    estimated_days: int = Field(
+        ..., ge=1, description="Total number of study days in the plan"
+    )
+    study_plan: List[StudyPlanDay] = Field(
+        ...,
+        min_length=1,
+        description="Day-by-day study schedule",
+    )
+
+
+class SimpleStudyPlanResponse(BaseModel):
+    """
+    Top-level response envelope for POST /api/study-plan.
+
+    Adds lightweight metadata around the LLM-generated plan so the client
+    can trace which query produced it and how many context chunks were used.
+
+    Example::
+
+        {
+            "query": "CPU Scheduling",
+            "model_used": "gemini-1.5-flash",
+            "chunks_used": 5,
+            "tokens_used": 1240,
+            "plan": {
+                "topic": "CPU Scheduling",
+                "estimated_days": 5,
+                "study_plan": [...]
+            }
+        }
+    """
+
+    query: str = Field(..., description="The original query echoed back")
+    model_used: str = Field(..., description="Gemini model that generated the plan")
+    chunks_used: int = Field(..., ge=0, description="Number of context chunks retrieved")
+    tokens_used: Optional[int] = Field(
+        default=None, description="Total tokens consumed by the LLM call"
+    )
+    plan: StudyPlanResult = Field(..., description="The generated study plan")
 
 
 # ---------------------------------------------------------------------------

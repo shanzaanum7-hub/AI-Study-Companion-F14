@@ -220,3 +220,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Uploaded documents
+backend/app/uploads/
+
+# VS Code
+.vscode/
+
+# Test files
+backend/test_gemini.py

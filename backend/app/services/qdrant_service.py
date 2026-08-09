@@ -290,3 +290,24 @@ def delete_document_vectors(document_id: str) -> Dict[str, Any]:
         ) from e
 
     return {"status": "success", "document_id": document_id}
+
+
+    # Add this at the END of qdrant_service.py
+
+class QdrantService:
+    def ping(self):
+        try:
+            client = _get_client()
+            client.get_collections()
+            return True
+        except Exception:
+            return False
+
+    def store_vectors(self, items):
+        return store_vectors(items)
+
+    def retrieve_vectors(self, query_embedding, top_k=5):
+        return retrieve_vectors(query_embedding, top_k)
+
+    def delete_document_vectors(self, document_id):
+        return delete_document_vectors(document_id)

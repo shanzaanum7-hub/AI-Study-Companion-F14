@@ -8,8 +8,11 @@ Responsibilities:
 - Generate embeddings for user queries.
 - Handle API timeouts, invalid API keys, and rate limits with retries.
 
-No API keys are hardcoded — everything is read from environment variables (.env).
-"""
+No API keys are hardcoded — everything is read from environment variables (.env)."""
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import os
 import time
@@ -30,15 +33,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration (read from .env)
 # ---------------------------------------------------------------------------
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004")
-# Kept in sync with GEMINI_EMBEDDING_DIMENSION in .env — used by qdrant_service.py
-GEMINI_EMBEDDING_DIMENSION = int(os.getenv("GEMINI_EMBEDDING_DIMENSION", 768))
+print("Gemini key loaded:", bool(GEMINI_API_KEY))
+
+GEMINI_EMBEDDING_MODEL = os.getenv(
+    "GEMINI_EMBEDDING_MODEL",
+    "models/text-embedding-004"
+)
+
+GEMINI_EMBEDDING_DIMENSION = int(
+    os.getenv("GEMINI_EMBEDDING_DIMENSION", 768)
+)
 
 MAX_RETRIES = int(os.getenv("EMBEDDING_MAX_RETRIES", 3))
 RETRY_BACKOFF_SECONDS = float(os.getenv("EMBEDDING_RETRY_BACKOFF", 2))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("EMBEDDING_TIMEOUT", 30))
-
 
 class EmbeddingServiceError(Exception):
     """Base exception for embedding service errors."""
