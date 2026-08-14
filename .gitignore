@@ -229,3 +229,7 @@ backend/app/uploads/
 
 # Test files
 backend/test_gemini.py
+# Next.js frontend
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
